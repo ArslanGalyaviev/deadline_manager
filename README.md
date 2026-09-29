@@ -38,6 +38,7 @@ deadline_manager/
 ├── main.py                  # Точка входа: модели SQLAlchemy, Pydantic-схемы, роуты FastAPI
 ├── pytest.ini               # Конфигурация pytest (asyncio_mode = auto)
 └── requirements.txt         # Зависимости проекта
+```
 
 ## Тестирование
 
