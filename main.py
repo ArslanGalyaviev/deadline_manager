@@ -1,72 +1,40 @@
-from fastapi import FastAPI, HTTPException
+import os
+import asyncio
+import aiosmtplib
+from email.message import EmailMessage
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
-from datetime import datetime
+from contextlib import asynccontextmanager
+from sqlalchemy.orm import declarative_base
+from sqlalchemy import Column, Integer, String, Boolean
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.future import select
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DATABASE_URL = f"postgresql+asyncpg://postgres:postgres@{DB_HOST}:5432/deadline_db"
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
 
 
-class DeadlineRepository:
-    def __init__(self):
-        self._deadlines = {}
-        self._next_id = 1
-
-    def add(self, deadline):
-        deadline.id = self._next_id
-        self._deadlines[deadline.id] = deadline
-        self._next_id += 1
-        return deadline.id
-
-    def get_by_id(self, id):
-        return self._deadlines.get(id)
-
-    def get_all_by_user(self, id):
-        return [d for d in self._deadlines.values() if d.user_id == id]
-
-    def delete(self, id):
-        if id in self._deadlines:
-            del self._deadlines[id]
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
 
 
-class Deadline:
-    def __init__(self, user_id, title, end_date, priority, category):
-        self.id = None
-        self.user_id = user_id
-        self.title = title
-        self.end_date = end_date
-        self.priority = priority
-        self.category = category
-        self.is_completed = False
+class DeadlineModel(Base):
+    __tablename__ = "deadlines"
 
-    def complete(self):
-        self.is_completed = True
-
-    def __str__(self):
-        status = "Выполнено" if self.is_completed else "Не выполнено"
-        return f"[{self.category}] {self.title} (До: {self.end_date}) - Приоритет: {self.priority} [{status}]"
-
-
-class User:
-    def __init__(self, user_id, nickname, repo):
-        self.user_id = user_id
-        self.nickname = nickname
-        self.repo = repo
-        self.deadline_ids = []
-
-    def create_deadline(self, title, end_date, priority, category):
-        deadline = Deadline(self.user_id, title, end_date, priority, category)
-        deadline_id = self.repo.add(deadline)
-        self.deadline_ids.append(deadline_id)
-        return deadline_id
-
-    def del_deadline(self, id):
-        if id in self.deadline_ids:
-            self.deadline_ids.remove(id)
-            self.repo.delete(id)
-
-    def get_deadlines(self):
-        return self.repo.get_all_by_user(self.user_id)
-
-
-app = FastAPI(title="Deadline Manager API")
-repo = DeadlineRepository()
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, index=True, nullable=False)
+    title = Column(String, nullable=False)
+    end_date = Column(String, nullable=False)
+    priority = Column(Integer, nullable=False)
+    category = Column(String, nullable=False)
+    is_completed = Column(Boolean, default=False, nullable=False)
 
 
 class DeadlineCreate(BaseModel):
@@ -79,66 +47,112 @@ class DeadlineCreate(BaseModel):
 
 class DeadlineResponse(BaseModel):
     id: int
+    user_id: int
     title: str
     end_date: str
     priority: int
     category: str
     is_completed: bool
 
+    model_config = {"from_attributes": True}
 
-@app.post("/deadlines", response_model=DeadlineResponse)
-def create_deadline(data: DeadlineCreate):
-    d = Deadline(
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await engine.dispose()
+
+
+app = FastAPI(title="Deadline Manager API", lifespan=lifespan)
+
+
+async def send_deadline_notification(email: str, title: str, end_date: str):
+    """Асинхронная фоновая задача отправки уведомления (SMTP)"""
+    message = EmailMessage()
+    message["Subject"] = f"Новый дедлайн: {title}"
+    message["From"] = "notifications@deadline-manager.local"
+    message["To"] = email
+    message.set_content(f"Напоминание: у вас есть дедлайн '{title}' до {end_date}.")
+
+    try:
+        async with aiosmtplib.SMTP(hostname="localhost", port=1025) as smtp:
+            await smtp.send_message(message)
+        print(f"[BACKGROUND TASK] Уведомление успешно отправлено на {email}")
+    except Exception as e:
+        print(f"[BACKGROUND TASK] Ошибка отправки уведомления (SMTP не запущен): {e}")
+
+
+@app.post("/deadlines", response_model=DeadlineResponse, status_code=201)
+async def create_deadline(data: DeadlineCreate, db: AsyncSession = Depends(get_db)):
+    new_deadline = DeadlineModel(
         user_id=data.user_id,
         title=data.title,
         end_date=data.end_date,
         priority=data.priority,
         category=data.category,
+        is_completed=False,
     )
-    repo.add(d)
-    return d
+    db.add(new_deadline)
+    await db.commit()
+    await db.refresh(new_deadline)
+
+    asyncio.create_task(
+        send_deadline_notification(
+            "user@example.com", new_deadline.title, new_deadline.end_date
+        )
+    )
+
+    return new_deadline
 
 
 @app.get("/deadlines/{user_id}", response_model=list[DeadlineResponse])
-def show_deadlines(user_id: int):
-    deadlines = repo.get_all_by_user(user_id)
+async def get_user_deadlines(
+    user_id: int,
+    category: Optional[str] = None,
+    priority: Optional[int] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(DeadlineModel).where(DeadlineModel.user_id == user_id)
+
+    if category is not None:
+        query = query.where(DeadlineModel.category == category)
+    if priority is not None:
+        query = query.where(DeadlineModel.priority == priority)
+
+    result = await db.execute(query)
+    deadlines = result.scalars().all()
+
     if not deadlines:
         raise HTTPException(status_code=404, detail="No deadlines found for this user")
     return deadlines
 
 
 @app.delete("/deadlines/{deadline_id}", status_code=204)
-def delete_deadline(deadline_id: int):
-    deadline = repo.get_by_id(deadline_id)
+async def delete_deadline(deadline_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(DeadlineModel).where(DeadlineModel.id == deadline_id)
+    )
+    deadline = result.scalars().first()
+
     if not deadline:
         raise HTTPException(status_code=404, detail="Deadline not found")
-    repo.delete(deadline_id)
+
+    await db.delete(deadline)
+    await db.commit()
 
 
 @app.patch("/deadlines/{deadline_id}/complete")
-def complete_deadline(deadline_id: int):
-    deadline = repo.get_by_id(deadline_id)
+async def complete_deadline(deadline_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(DeadlineModel).where(DeadlineModel.id == deadline_id)
+    )
+    deadline = result.scalars().first()
+
     if not deadline:
         raise HTTPException(status_code=404, detail="Deadline not found")
-    deadline.complete()
+
+    deadline.is_completed = True
+    await db.commit()
+    await db.refresh(deadline)
+
     return {"message": "Deadline marked as completed", "deadline": deadline}
-
-
-if __name__ == "__main__":
-    r = DeadlineRepository()
-    u = User(1, "Arslan", r)
-
-    u.create_deadline("wash the dish", "30.09.2026", 1, "home")
-    u.create_deadline("do H/W", "20.09.2026", 2, "school")
-    u.create_deadline("travel to Turkey", "10.12.2026", 3, "traveling")
-
-    for d in u.get_deadlines():
-        print(d)
-
-    deadlines = u.get_deadlines()
-    deadlines[0].complete()
-
-    u.del_deadline(deadlines[1].id)
-
-    for d in u.get_deadlines():
-        print(d)
